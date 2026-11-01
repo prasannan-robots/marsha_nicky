@@ -1,116 +1,163 @@
+"""Marsha Nicky - an AI chat bot for Discord.
+
+Environment: DISCORD_TOKEN, OPENAI_API_KEY (required); GITHUB_TOKEN +
+MEMORY_REPO to persist memory (optional); OWNER_ID (optional, your Discord
+user ID, can always run admin commands).
+
+Enable the "Message Content" privileged intent for the bot in the Discord
+developer portal, otherwise it can't read messages.
+"""
+
+import asyncio
+import logging
 import os
+import sys
 
 import discord
-from open_ai_chatbot import ask,append_interaction_to_chat_log
-import github_storage
 
-client = discord.Client()
-github_storage_object = github_storage.github_store()
+from brain import Brain
 
-class var:
-    TOKEN = os.getenv('DISCORD_TOKEN')
-    chat_log = None
-    normal_talk = False
-    sync_toggle_normal = False
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("marsha")
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+DISCORD_LIMIT = 2000
+
+HELP = """```
+I am an AI. My name is Marsha Nicky.
+Mention me, or start a message with @! to talk to me.
+^toggle-normal-talk  (^tg-nl)  talk without pinging me in this channel
+^show-chat-log       (^sh-chl) show what I remember in this channel  [mods]
+^clear-chat-log      (^cl-chl) forget this channel's conversation    [mods]
+^sync-chat-log       (^sy-chl) save memory to GitHub                 [mods]
+^pull-chat-log       (^pl-chl) load memory from GitHub               [mods]
+```"""
+
+intents = discord.Intents.default()
+intents.message_content = True  # required since 2022 to read message text
+client = discord.Client(intents=intents)
+brain = Brain()
+normal_talk_channels: set[int] = set()
+storage = None
+
+
+def get_storage():
+    global storage
+    if storage is None and os.getenv("GITHUB_TOKEN"):
+        from github_storage import github_store
+        storage = github_store()
+    return storage
+
+
+def is_moderator(message: discord.Message) -> bool:
+    """Admin commands used to work for anyone in any server."""
+    if OWNER_ID and message.author.id == OWNER_ID:
+        return True
+    permissions = getattr(message.channel, "permissions_for", None)
+    return bool(permissions and permissions(message.author).manage_messages)
+
+
+def split(text: str, limit: int = DISCORD_LIMIT - 100) -> list[str]:
+    return [text[i:i + limit] for i in range(0, len(text), limit)] or ["…"]
+
+
+async def reply(message: discord.Message, question: str) -> None:
+    question = question.strip()
+    if not question:
+        await message.channel.send(f"{message.author.mention} yes? 🙂")
+        return
+    async with message.channel.typing():
+        try:
+            answer = await brain.ask(message.channel.id, message.author.display_name, question)
+        except Exception:
+            log.exception("OpenAI request failed")
+            answer = "Sorry, my brain glitched. Try again in a moment."
+    for i, chunk in enumerate(split(answer)):
+        await message.channel.send(f"{message.author.mention} {chunk}" if i == 0 else chunk)
+
+
+async def sync_memory() -> bool:
+    store = get_storage()
+    if not store:
+        return False
+    await asyncio.to_thread(store.push, brain.export())
+    return True
+
 
 @client.event
 async def on_ready():
-    print(f'{client.user} has connected to Discord!')
-    var.chat_log = github_storage_object.pull_data()
-    for guild in client.guilds:
-        print(guild.name,guild.id)
-    await client.change_presence(status = discord.Status.idle)
+    log.info("%s connected to %d server(s)", client.user, len(client.guilds))
+    store = get_storage()
+    if store:
+        try:
+            brain.load(await asyncio.to_thread(store.pull_data))
+        except Exception:
+            log.exception("Couldn't load memory from GitHub")
+    await client.change_presence(status=discord.Status.idle)
+
+
+ADMIN = {
+    ("^show-chat-log", "^sh-chl"): "show",
+    ("^clear-chat-log", "^cl-chl"): "clear",
+    ("^sync-chat-log", "^sy-chl"): "sync",
+    ("^pull-chat-log", "^pl-chl"): "pull",
+}
+
 
 @client.event
-async def on_message(message):
-    print(f"{message.channel}: {message.author}: {message.author.name}: {message.content}")
-    if message.author == client.user:
+async def on_message(message: discord.Message):
+    if message.author.bot:
         return
-    elif message.author.bot: 
+    content = message.content.strip()
+
+    if content == "^help":
+        await message.channel.send(HELP)
         return
-    
-    elif client.user.mentioned_in(message):
-        await client.change_presence(status = discord.Status.do_not_disturb)
-        msg = message.content
-        msg = msg.split(' ', 1)[1]
-        print(msg)
-        answer = ask(msg, var.chat_log)
-        var.chat_log = append_interaction_to_chat_log(msg, answer, var.chat_log)
-        await message.channel.send(f"{message.author.mention} {answer}")
-        await client.change_presence(status = discord.Status.idle)
-    
-    elif message.content.startswith('@!'):
-        msg = message.content.replace('@!','')
-        await client.change_presence(status = discord.Status.do_not_disturb)
-        answer = ask(msg, var.chat_log)
-        var.chat_log = append_interaction_to_chat_log(msg, answer, var.chat_log)
 
-        await message.channel.send(f"{message.author.mention} {answer}")
-        github_storage_object.push(update=True,content=var.chat_log)
-        await client.change_presence(status = discord.Status.idle)
-
-    elif message.content == "^show-chat-log" or message.content == "^sh-chl":
-        chat_log_file = open("chat-log.txt","w")
-        chat_log_file.write(str(var.chat_log))
-        await message.channel.send(file=discord.File("chat-log.txt"))
-        os.remove("chat-log.txt")
-
-    elif message.content == "^clear-chat-log" or message.content == "^cl-chl":
-        var.chat_log = None
-        await message.channel.send("Done")
-    
-    elif message.content == "^toggle-normal-talk" or message.content =="^tg-nl":
-        
-        if var.normal_talk == False:
-            var.normal_talk =  True
-            await client.change_presence(status = discord.Status.online)
-            await message.channel.send(f"Toggled Mode to normal talk")
+    if content in ("^toggle-normal-talk", "^tg-nl"):
+        if message.channel.id in normal_talk_channels:
+            normal_talk_channels.discard(message.channel.id)
+            await message.channel.send("Toggled mode to ping talk")
         else:
-            var.normal_talk =  False
-            await client.change_presence(status = discord.Status.idle)
-            await message.channel.send(f"Toggled Mode to ping talk")
-    elif message.content == "^sync-chat-log" or message.content == "^sy-chl":
-        github_storage_object.push(update=True,content=var.chat_log)
-        await message.channel.send(f"Synced chats")
-    elif message.content == "^pull-chat-log" or message.content == "^pl-chl":
-        var.chat_log = github_storage_object.pull_data()
-        await message.channel.send(f"Pulled chat log")
-    elif message.content == "^sync-toggle-normal" or message.content == "^sy-tg-nl":
-        
-        if var.sync_toggle_normal == True:
-            await message.channel.send(f"Disabled sync-toggle-normal")
-            var.sync_toggle_normal = False
-        elif var.sync_toggle_normal == False:
-            await message.channel.send(f"Enabled sync-toggle-normal")
-            var.sync_toggle_normal = True
-    elif message.content == "^help":
-        await message.channel.send("""
-        ```
-I am a AI. My name is Marsha Nicky.
-Ping me to talk or use @! (use @! to sync chat-log at every message) before your text message to talk
-^toggle-normal-talk or ^tg-nl ----- Use this to talk to me directly without pinging me
-^show-chat-log or ^sh-chl --------- Use this to show all saved chat logs
-^clear-chat-log or ^cl-chl -------- Use this to clear all saved chat logs
-^sync-chat-log or ^sy-chl --------- Use this to make your bot remember
-^pull-chat-log or ^pl-chl --------- Use this to pull chat log from github
-^sync-toggle-normal-talk or ^sy-tg-nl - Use this to enable sync on normal talk mode
-        ```
-        """)
+            normal_talk_channels.add(message.channel.id)
+            await message.channel.send("Toggled mode to normal talk in this channel")
+        return
 
-    elif var.normal_talk == True:
-        await client.change_presence(status = discord.Status.do_not_disturb)
-        answer = ask(message.content, var.chat_log)
-        var.chat_log = append_interaction_to_chat_log(message.content, answer, var.chat_log)
-        
-        await message.channel.send(f"{message.author.mention} {answer}")
-        if var.sync_toggle_normal == True:
-            github_storage_object.push(update=True,content=var.chat_log)
-        else:
-            pass
-        await client.change_presence(status = discord.Status.idle)
-    
-    
-    
-    
+    for aliases, action in ADMIN.items():
+        if content in aliases:
+            if not is_moderator(message):
+                await message.channel.send("Only moderators can do that.")
+                return
+            if action == "show":
+                await message.channel.send(f"```\n{brain.transcript(message.channel.id)[-1800:]}\n```")
+            elif action == "clear":
+                brain.clear(message.channel.id)
+                await message.channel.send("Done, I forgot this channel's conversation.")
+            elif action == "sync":
+                ok = await sync_memory()
+                await message.channel.send("Synced memory" if ok else "GitHub storage isn't configured.")
+            elif action == "pull":
+                store = get_storage()
+                if store:
+                    brain.load(await asyncio.to_thread(store.pull_data))
+                await message.channel.send("Pulled memory" if store else "GitHub storage isn't configured.")
+            return
 
-client.run(var.TOKEN)
+    if client.user in message.mentions:
+        question = content.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "")
+        await reply(message, question)
+    elif content.startswith("@!"):
+        await reply(message, content[2:])
+        try:
+            await sync_memory()
+        except Exception:
+            log.exception("Memory sync failed")
+    elif message.channel.id in normal_talk_channels:
+        await reply(message, content)
+
+
+if __name__ == "__main__":
+    if not TOKEN or not os.getenv("OPENAI_API_KEY"):
+        sys.exit("Set DISCORD_TOKEN and OPENAI_API_KEY.")
+    client.run(TOKEN, log_handler=None)

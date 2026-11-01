@@ -1,35 +1,34 @@
-from github import Github
+"""Persist the bot's memory as a JSON file in a GitHub repository."""
+
+import json
 import os
 
+from github import Github, GithubException
+
+
 class github_store:
-    def __init__(self,file_path=None):
-        if file_path == None:
-            self.file_path = "chat_log.txt"
-        self.token = os.getenv("GITHUB_TOKEN")
-        self.github_object = Github(self.token)
-        self.branch = "main"
-        self.repository = self.github_object.get_repo("marsha-nicky/my_knowledge")
-    
-    def pull_data(self):
-        contents = self.repository.get_contents(self.file_path, ref=self.branch)
-        return contents.decoded_content.decode()
+    def __init__(self, file_path=None, repo=None, branch=None, token=None):
+        # The old version ignored file_path when one was passed.
+        self.file_path = file_path or os.getenv("MEMORY_PATH", "memory.json")
+        self.github_object = Github(token or os.getenv("GITHUB_TOKEN"))
+        self.repository = self.github_object.get_repo(repo or os.getenv("MEMORY_REPO", "marsha-nicky/my_knowledge"))
+        self.branch = branch or os.getenv("MEMORY_BRANCH") or self.repository.default_branch
 
-    def push(self,path=None, message=None, content=None, branch=None, update=False):
+    def pull_data(self) -> dict:
+        try:
+            contents = self.repository.get_contents(self.file_path, ref=self.branch)
+        except GithubException as error:
+            if error.status == 404:
+                return {}
+            raise
+        return json.loads(contents.decoded_content.decode() or "{}")
 
-        if path == None:
-            path = self.file_path
-        if message == None:
-            message = "Added chat knowledge"
-        if content == None:
-            content = self.data
-        if branch == None:
-            branch = self.branch
-
-        source = self.repository.get_branch(branch)
-        if update:  # If file already exists, update it
-            contents = self.repository.get_contents(path, ref=branch)  # Retrieve old file to get its SHA and path
-            self.repository.update_file(contents.path, message, content, contents.sha, branch=branch)  # Add, commit and push branch
-            print("github_storage : updated content")
-        else:  # If file doesn't exist, create it
-            self.repository.create_file(path, message, content, branch=branch)  # Add, commit and push branch
-
+    def push(self, data: dict, message="Update chat memory") -> None:
+        content = json.dumps(data, ensure_ascii=False, indent=1)
+        try:
+            existing = self.repository.get_contents(self.file_path, ref=self.branch)
+            self.repository.update_file(existing.path, message, content, existing.sha, branch=self.branch)
+        except GithubException as error:
+            if error.status != 404:
+                raise
+            self.repository.create_file(self.file_path, message, content, branch=self.branch)
